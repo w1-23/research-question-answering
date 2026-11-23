@@ -1,0 +1,2 @@
+# Runtime and tests: CPython 3.11+ standard library only.
+# No third-party packages to resolve or install.
