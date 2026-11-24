@@ -67,6 +67,37 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         local_call.assert_awaited_once_with(QUERY, 2, 1)
         web_call.assert_awaited_once_with(QUERY, 2, 1)
 
+    async def test_equivalent_reused_discovery_skips_call_and_stays_bounded(self):
+        local = AsyncMock(return_value=Discovery("hits", (BASE,)))
+        web = AsyncMock(return_value=Discovery("hits", (WEB,)))
+        result = await discover(
+            QUERY,
+            {"local": local, "web": web},
+            reuse={"local": Discovery("hits", (replace(BASE, preview="x" * 1000), SHARED))},
+            limit=1,
+            timeout=2,
+        )
+        self.assertEqual(len(result["local"].candidates), 1)
+        self.assertEqual(result["local"].candidates[0].source_ref, BASE.source_ref)
+        self.assertEqual(len(result["local"].candidates[0].preview), 600)
+        self.assertEqual(result["web"].candidates, (WEB,))
+        local.assert_not_awaited()
+        web.assert_awaited_once_with(QUERY, 1, 2)
+
+    async def test_invalid_reused_result_is_not_promoted_to_evidence(self):
+        local = AsyncMock(return_value=Discovery("hits", (BASE,)))
+        result = await discover(
+            QUERY,
+            {"local": local},
+            reuse={"local": Discovery("hits", (Candidate("local", "No durable handle"),))},
+        )
+        self.assertEqual(result["local"], Discovery("failed", reason="invalid_discovery_result"))
+        local.assert_not_awaited()
+
+    async def test_reused_route_must_be_explicitly_requested(self):
+        with self.assertRaisesRegex(ValueError, "reused route was not requested"):
+            await discover(QUERY, {"local": None}, reuse={"web": Discovery("empty")})
+
     async def test_local_zero_hits_can_use_one_selected_web_excerpt(self):
         local = AsyncMock(return_value=Discovery("empty"))
         web = AsyncMock(return_value=Discovery("hits", (WEB,)))
@@ -82,9 +113,12 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_host_omits_research_for_translation_and_attachment_plot(self):
         available_search = AsyncMock()
-        for subgoal in ("Translate this pathology paragraph", "Plot this supplied qPCR table"):
+        for subgoal in ("Translate this pathology paragraph",
+                        "Plot this supplied qPCR table",
+                        "Plot the supplied LC-MS TSS_percent table as a boxplot"):
             with self.subTest(subgoal=subgoal):
                 self.assertEqual(await discover(subgoal, {}), {})
+        available_search.assert_not_awaited()
         mixed = await discover(QUERY, {"local": None, "web": available_search})
         self.assertEqual(mixed["local"].status, "unavailable")
         available_search.assert_awaited_once_with(QUERY, 4, 10.0)
@@ -188,6 +222,13 @@ class CitationTests(unittest.TestCase):
         self.assertEqual(citation_packet(records, []), ())
         self.assertEqual(packet[1].read_entry, SHARED.read_entry)
         self.assertEqual(packet[1].locator, SHARED.locator)
+
+    def test_packet_returns_stable_refs_without_user_facing_labels(self):
+        record = replace(WEB_EVIDENCE, display_label="")
+        packet = citation_packet([record], [record.source_ref])
+        self.assertEqual([item.source_ref for item in packet], [WEB_EVIDENCE.source_ref])
+        self.assertEqual(packet[0].display_label, "")
+        self.assertEqual(packet[0].url, WEB_EVIDENCE.url)
 
     def test_candidates_missing_refs_and_conflicts_cannot_be_cited(self):
         shared = local_evidence(SHARED)

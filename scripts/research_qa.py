@@ -87,6 +87,20 @@ def _valid_candidate(candidate: Candidate) -> bool:
         _nonempty(candidate.source_ref) and bool(candidate.read_entry)))
 
 
+def _bounded_discovery(route: Route, result: Discovery, limit: int) -> Discovery:
+    if not isinstance(result, Discovery):
+        return Discovery("failed", reason="invalid_discovery_result")
+    if result.status in _FAILURES | {"empty"} and not result.candidates:
+        return result
+    candidates = result.candidates[:limit]
+    if (result.status == "partial" or (result.status == "hits" and candidates)) and all(
+        _valid_candidate(item) and item.route == route for item in candidates
+    ):
+        bounded = tuple(replace(item, preview=item.preview[:600]) for item in candidates)
+        return replace(result, candidates=bounded)
+    return Discovery("failed", reason="invalid_discovery_result")
+
+
 async def _discover_route(route: Route, call: Discover | None, query: str,
                           limit: int, timeout: float) -> Discovery:
     if call is None:
@@ -94,37 +108,41 @@ async def _discover_route(route: Route, call: Discover | None, query: str,
     try:
         async with asyncio.timeout(timeout):
             result = await call(query, limit, timeout)
-        if not isinstance(result, Discovery):
-            return Discovery("failed", reason="invalid_discovery_result")
-        if result.status in _FAILURES | {"empty"} and not result.candidates:
-            return result
-        candidates = result.candidates[:limit]
-        if (result.status == "partial" or (result.status == "hits" and candidates)) and all(
-            _valid_candidate(item) and item.route == route for item in candidates
-        ):
-            bounded = tuple(replace(item, preview=item.preview[:600]) for item in candidates)
-            return replace(result, candidates=bounded)
+        return _bounded_discovery(route, result, limit)
     except TimeoutError:
         return Discovery("timeout", reason="deadline")
     except Exception:
         return Discovery("failed", reason="capability_error")
-    return Discovery("failed", reason="invalid_discovery_result")
 
 
 async def discover(query: str, routes: Mapping[Route, Discover | None], *,
+                   reuse: Mapping[Route, Discovery] | None = None,
                    limit: int = 4, timeout: float = 10.0) -> dict[Route, Discovery]:
-    """Try each explicitly selected route once. An empty mapping performs no research."""
+    """Run each selected route once, preferring host-proven equivalent results."""
     _check_limit(limit, 12)
     _check_timeout(timeout)
     entries = tuple(routes.items())
     if any(route not in {"local", "web"} for route, _ in entries):
         raise ValueError("unknown discovery route")
+    if reuse is not None and not isinstance(reuse, Mapping):
+        raise ValueError("reuse must map routes to discoveries")
+    reused_entries = tuple((reuse or {}).items())
+    if any(route not in {"local", "web"} for route, _ in reused_entries):
+        raise ValueError("unknown reused route")
+    requested = {route for route, _ in entries}
+    if any(route not in requested for route, _ in reused_entries):
+        raise ValueError("reused route was not requested")
     if entries and not _nonempty(query):
         raise ValueError("query must be nonempty for discovery")
+    reused = {route: _bounded_discovery(route, result, limit)
+              for route, result in reused_entries}
+    pending = tuple((route, call) for route, call in entries if route not in reused)
     results = await asyncio.gather(*(
-        _discover_route(route, call, query, limit, timeout) for route, call in entries
+        _discover_route(route, call, query, limit, timeout) for route, call in pending
     ))
-    return {route: result for (route, _), result in zip(entries, results)}
+    combined = dict(reused)
+    combined.update({route: result for (route, _), result in zip(pending, results)})
+    return {route: combined[route] for route, _ in entries}
 
 
 def _valid_evidence(evidence: Evidence, max_chars: int) -> bool:
@@ -187,7 +205,11 @@ async def read_selected(candidate: Candidate, call: Read | None, *, offset: int 
 
 def citation_packet(records: Iterable[Evidence], selected_refs: Iterable[str], *,
                     max_chars: int = 2000) -> tuple[Evidence, ...]:
-    """Project a caller-selected list of stable refs from its currently permitted excerpts."""
+    """Return adopted records in caller order without creating display labels.
+
+    The host owns user-facing local/web numbering. Each returned ``source_ref`` is
+    the stable evidence identity to persist and use for that display projection.
+    """
     _check_limit(max_chars, 6000)
     if isinstance(selected_refs, str):
         raise ValueError("selected_refs must be a sequence of references")
