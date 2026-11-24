@@ -17,4 +17,5 @@ The example loads the same Python helpers in a web-only replay host. Its data is
 
 ## Changes
 
+- Reuse host-proven equivalent discovery without repeating a route, and keep stable evidence refs separate from host-owned display labels.
 - Initial release. Adds the method, a bounded callback API, evidence selection and independent synthetic tests.
